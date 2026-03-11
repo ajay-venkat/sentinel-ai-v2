@@ -148,3 +148,88 @@ def simulate_live_stream(
     for post in posts:
         yield post
         time.sleep(interval_seconds)
+
+
+# ---------------------------------------------------------------------------
+# RSS feed reader (live external data — no API key required)
+# ---------------------------------------------------------------------------
+def fetch_rss_posts(feed_url: str, limit: int = 25) -> List[Dict[str, object]]:
+    """Fetch posts from an RSS/Atom feed and return them in the standard format.
+
+    Each item gets text from <title> + <summary>, timestamp from <published>,
+    and followers defaults to 1 (RSS feeds don't expose this).
+    """
+    try:
+        import feedparser
+    except ImportError:
+        return []
+
+    if not feed_url or not feed_url.strip():
+        return []
+
+    # Fetch the feed content ourselves to handle SSL issues on macOS
+    # and to send a proper User-Agent (some sites block default feedparser UA).
+    import ssl
+    import urllib.request
+
+    try:
+        ctx = ssl.create_default_context()
+        req = urllib.request.Request(
+            feed_url.strip(),
+            headers={"User-Agent": "Mozilla/5.0 SentinelAI/1.0"},
+        )
+        try:
+            raw = urllib.request.urlopen(req, context=ctx, timeout=15).read()
+        except Exception:
+            # macOS Python often lacks system certs — fall back safely
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            raw = urllib.request.urlopen(req, context=ctx, timeout=15).read()
+        feed = feedparser.parse(raw)
+    except Exception:
+        # Last resort: let feedparser try its own fetch
+        feed = feedparser.parse(feed_url)
+
+    posts: List[Dict[str, object]] = []
+    for entry in feed.entries[:limit]:
+        title = str(getattr(entry, "title", "") or "")
+        summary = str(getattr(entry, "summary", "") or "")
+        # Strip HTML tags from summary
+        summary_clean = re.sub(r"<[^>]+>", " ", summary)
+        text = f"{title}. {summary_clean}".strip()
+        if not text or text == ".":
+            continue
+
+        published = getattr(entry, "published", "") or ""
+        try:
+            ts = pd.to_datetime(published, utc=True).isoformat()
+        except Exception:
+            ts = pd.Timestamp.now(tz="UTC").isoformat()
+
+        posts.append({
+            "text": text,
+            "timestamp": ts,
+            "followers": 1,
+            "source": "rss",
+        })
+    return posts
+
+
+# ---------------------------------------------------------------------------
+# Read uploaded file bytes (CSV / JSON)
+# ---------------------------------------------------------------------------
+def read_uploaded_file(file_bytes, file_name: str) -> List[Dict[str, object]]:
+    """Parse an uploaded CSV or JSON file from raw bytes."""
+    import io
+
+    if file_name.lower().endswith(".json"):
+        df = pd.read_json(io.BytesIO(file_bytes))
+    else:
+        df = pd.read_csv(io.BytesIO(file_bytes))
+
+    required = {"text", "timestamp", "followers"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {sorted(missing)}")
+    return df.to_dict(orient="records")
