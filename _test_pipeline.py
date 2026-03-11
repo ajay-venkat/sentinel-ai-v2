@@ -1,11 +1,12 @@
 """Dynamic Sentinel AI Pipeline — fetches Reddit comments, streams data, watches for updates, and reports live metrics."""
 
 import os
+import random
 import sys
 import time
 import traceback
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -222,6 +223,148 @@ def watch_and_update(models, tracker: MetricsTracker) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Fake Reddit comment generator (demo mode)
+# ---------------------------------------------------------------------------
+_FAKE_COMMENTS = [
+    # Negative — Quality
+    "This app crashes every single time I try to open settings. Completely unusable on Android.",
+    "Latest update broke dark mode and now my eyes are bleeding at 2am. Thanks devs.",
+    "Been getting data corruption errors since v4.3. Lost a week of work. Absolutely furious.",
+    "Memory usage is insane — 4GB for a note-taking app? Is it running a blockchain in the background?",
+    "The search feature returns completely irrelevant results. It's like it's searching a different database.",
+    "App freezes for 30 seconds every time I try to export a PDF. This is enterprise software??",
+    "Three major bugs in three weeks. QA team must be on permanent vacation.",
+    "Sync has been broken for 5 days. Support says 'we're working on it.' Cool story.",
+    "The new editor is so slow I can literally watch each character appear. Going back to Notepad.",
+    "Just lost all my saved templates after the auto-update. No backup, no warning. Unacceptable.",
+    # Negative — Price
+    "$39/month for THIS? The free tier of the competitor does more. What a joke.",
+    "They raised prices 40% and removed features. Classic bait and switch.",
+    "The premium plan costs more than my Netflix, Spotify and gym combined. For a productivity app.",
+    "Hidden fees everywhere. The advertised price is basically a lie.",
+    "Just got charged $299 for annual renewal I never agreed to. Disputing with bank.",
+    # Negative — Service
+    "Support ticket open for 2 weeks. Zero response. Not even an automated 'we got your message'.",
+    "Called support, got transferred 4 times, then disconnected. Peak customer service.",
+    "The chatbot is useless — keeps telling me to 'check the FAQ' for a billing error.",
+    "Waited 3 hours for live chat. Agent copy-pasted a generic response and closed the ticket.",
+    "Tried to cancel subscription, got put through a 7-step retention maze. Dark patterns much?",
+    # Positive — Quality
+    "New update is genuinely great. Performance improvements are noticeable immediately.",
+    "The real-time collaboration feature works flawlessly. Our team productivity doubled.",
+    "Finally an app that handles large files without choking. Processed 2GB dataset in seconds.",
+    "The new UI is clean, fast, and intuitive. Best update in years honestly.",
+    "Offline mode actually works perfectly now. Used it on a 12-hour flight, zero issues.",
+    "The API is incredibly well-designed. Integrated it with our pipeline in under an hour.",
+    "Dark mode is perfect — proper OLED black, not that fake dark grey most apps use.",
+    # Positive — Service
+    "Support resolved my issue in 8 minutes. Actual human, knew exactly what to do. 10/10.",
+    "The onboarding team walked us through enterprise setup personally. Incredible service.",
+    "Got a full refund no questions asked within 24 hours. Respect.",
+    "Their community forum is super active. Got help from a dev within an hour.",
+    # Positive — Price
+    "Free tier is incredibly generous. Gets 90% of what most people need.",
+    "Switched from competitor and saving $200/year for better features. No brainer.",
+    "The student discount makes this basically free. Huge respect for that.",
+    # Neutral / Informational
+    "Server maintenance tonight 11PM-3AM EST. Plan accordingly.",
+    "New beta version available in the insider channel. Anyone tried it yet?",
+    "PSA: the export bug workaround is to use CSV format instead of JSON.",
+    "Changelog for v4.4 looks promising. 47 bug fixes and 3 new integrations.",
+    "Anyone know if the Linux client supports Wayland yet?",
+    # Sarcastic
+    "Oh great another update that 'improves stability'. Can't wait to see what breaks this time.",
+    "Love how 'premium support' means waiting 48 hours instead of 72. Worth every penny lol.",
+    "Amazing that a billion-dollar company can't make a login page that works. Truly inspiring.",
+    "Yeah the app is 'blazing fast' if you have a supercomputer and fiber internet.",
+    "lol they call this an 'AI feature'? It literally just searches Google and summarizes badly.",
+]
+
+
+def generate_fake_reddit_batch(count: int = 10) -> list[dict]:
+    """Generate a batch of realistic fake Reddit-style comments."""
+    now = datetime.now(timezone.utc)
+    batch = []
+    selected = random.sample(_FAKE_COMMENTS, min(count, len(_FAKE_COMMENTS)))
+    for i, text in enumerate(selected):
+        batch.append({
+            "text": text,
+            "timestamp": (now - timedelta(seconds=random.randint(0, 300))).isoformat(),
+            "followers": random.choice([100, 500, 1200, 3500, 8000, 15000, 25000, 50000]),
+            "source": "reddit-demo",
+        })
+    return batch
+
+
+def demo_live_loop(models, tracker: MetricsTracker) -> None:
+    """Simulate a live Reddit stream using fake data — no credentials needed."""
+    poll = max(REDDIT_POLL // 6, 5)  # faster for demo
+    batch_size = 8
+
+    print(f"\n{'=' * 60}")
+    print(f"  🎭 DEMO MODE — Simulated Reddit Live Stream")
+    print(f"  Generating {batch_size} fake comments every {poll}s")
+    print(f"  Press Ctrl+C to stop.")
+    print(f"{'=' * 60}\n")
+
+    used_comments: set[str] = set()
+    cycle = 0
+
+    try:
+        while True:
+            cycle += 1
+            print(f"\n--- Demo cycle #{cycle} ({datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}) ---")
+
+            # Generate comments not yet used
+            available = [c for c in _FAKE_COMMENTS if c not in used_comments]
+            if not available:
+                print("  🔄 All demo comments used. Resetting pool…")
+                used_comments.clear()
+                available = _FAKE_COMMENTS[:]
+
+            count = min(batch_size, len(available))
+            posts = []
+            selected = random.sample(available, count)
+            now = datetime.now(timezone.utc)
+            for text in selected:
+                posts.append({
+                    "text": text,
+                    "timestamp": (now - timedelta(seconds=random.randint(0, 120))).isoformat(),
+                    "followers": random.choice([200, 800, 2500, 6000, 12000, 22000, 40000]),
+                    "source": "reddit-demo",
+                })
+                used_comments.add(text)
+
+            print(f"  📥 Generated {len(posts)} simulated Reddit comments.")
+
+            # Append to CSV
+            saved = append_posts_to_csv(posts, DATA_SOURCE)
+            if saved:
+                print(f"  💾 Saved {saved} new rows to '{DATA_SOURCE}'.")
+
+            # Analyse live
+            print()
+            stream_analyze(posts, models, tracker, start_idx=0)
+            tracker.print_snapshot()
+
+            if cycle % 2 == 0:
+                tracker.print_keywords()
+                tracker.print_ai_insights()
+
+            print(f"\n  ⏳ Next batch in {poll}s…")
+            time.sleep(poll)
+
+    except KeyboardInterrupt:
+        print("\n\n⏹  Demo mode stopped.")
+        print("\n" + "=" * 60)
+        print("  FINAL REPORT")
+        print("=" * 60)
+        tracker.print_snapshot()
+        tracker.print_keywords()
+        tracker.print_ai_insights()
+
+
+# ---------------------------------------------------------------------------
 # Reddit real-time fetcher
 # ---------------------------------------------------------------------------
 def get_reddit_config() -> RedditConfig:
@@ -379,9 +522,10 @@ def main() -> None:
     print("    2. Fetch Reddit comments (one-time) + analyse")
     print("    3. Live Reddit stream (continuous polling)")
     print("    4. Full pipeline: CSV + Reddit live")
+    print("    5. 🎭 DEMO — Simulated Reddit live (no credentials needed)")
     print()
 
-    mode = input("  Select mode [1/2/3/4] (default=1): ").strip() or "1"
+    mode = input("  Select mode [1/2/3/4/5] (default=5): ").strip() or "5"
 
     print(f"\n  Data source:  {DATA_SOURCE}")
     print(f"  Poll interval: {POLL_INTERVAL}s")
@@ -437,8 +581,21 @@ def main() -> None:
         # Then enter Reddit live loop
         reddit_live_loop(models, tracker, cfg)
 
+    # --- MODE 5: Demo mode (fake Reddit data) ---
+    elif mode == "5":
+        # Optionally analyse existing CSV first
+        try:
+            posts = read_stream_source(DATA_SOURCE)
+            print(f"📊 Analysing {len(posts)} existing posts from CSV…\n")
+            stream_analyze(posts, models, tracker)
+            tracker.print_snapshot()
+        except (FileNotFoundError, ValueError):
+            print("  No existing CSV data. Starting with demo data only.\n")
+        # Enter demo live loop
+        demo_live_loop(models, tracker)
+
     else:
-        print("❌ Invalid mode. Use 1, 2, 3, or 4.")
+        print("❌ Invalid mode. Use 1, 2, 3, 4, or 5.")
         sys.exit(1)
 
 
