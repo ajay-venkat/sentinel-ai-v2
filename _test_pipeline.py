@@ -1,15 +1,16 @@
-"""Dynamic Sentinel AI Pipeline — streams data, watches for updates, and reports live metrics."""
+"""Dynamic Sentinel AI Pipeline — fetches Reddit comments, streams data, watches for updates, and reports live metrics."""
 
 import os
 import sys
 import time
 import traceback
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 
-from engine import analyze_post, extract_keywords, load_models
+from engine import RedditConfig, analyze_post, extract_keywords, fetch_reddit_posts, load_models
 from utils import (
     generate_ai_response,
     read_stream_source,
@@ -22,6 +23,13 @@ from utils import (
 DATA_SOURCE = os.environ.get("SENTINEL_DATA", str(Path("data") / "sample_posts.csv"))
 POLL_INTERVAL = int(os.environ.get("SENTINEL_POLL", "5"))  # seconds between file-change checks
 STREAM_DELAY = float(os.environ.get("SENTINEL_DELAY", "0.3"))  # delay per post during streaming
+REDDIT_POLL = int(os.environ.get("SENTINEL_REDDIT_POLL", "60"))  # seconds between Reddit fetches
+
+# Reddit credentials (set via env vars or prompted interactively)
+REDDIT_CLIENT_ID = os.environ.get("REDDIT_CLIENT_ID", "")
+REDDIT_CLIENT_SECRET = os.environ.get("REDDIT_CLIENT_SECRET", "")
+REDDIT_SUBREDDIT = os.environ.get("REDDIT_SUBREDDIT", "technology")
+REDDIT_LIMIT = int(os.environ.get("REDDIT_LIMIT", "25"))
 
 
 # ---------------------------------------------------------------------------
@@ -214,13 +222,168 @@ def watch_and_update(models, tracker: MetricsTracker) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Reddit real-time fetcher
+# ---------------------------------------------------------------------------
+def get_reddit_config() -> RedditConfig:
+    """Build Reddit config from env vars or interactive prompts."""
+    client_id = REDDIT_CLIENT_ID
+    client_secret = REDDIT_CLIENT_SECRET
+    subreddit = REDDIT_SUBREDDIT
+
+    if not client_id:
+        client_id = input("  Reddit Client ID: ").strip()
+    if not client_secret:
+        client_secret = input("  Reddit Client Secret: ").strip()
+    if not subreddit:
+        subreddit = input("  Subreddit (default: technology): ").strip() or "technology"
+
+    return RedditConfig(
+        client_id=client_id,
+        client_secret=client_secret,
+        subreddit=subreddit,
+        limit=REDDIT_LIMIT,
+    )
+
+
+def append_posts_to_csv(posts: list[dict], csv_path: str) -> int:
+    """Append new Reddit posts to the CSV, skipping duplicates. Returns count of new rows."""
+    path = Path(csv_path)
+    if path.exists():
+        existing_df = pd.read_csv(path)
+        existing_texts = set(existing_df["text"].astype(str).tolist())
+    else:
+        existing_df = pd.DataFrame(columns=["timestamp", "text", "followers"])
+        existing_texts = set()
+
+    new_rows = []
+    for post in posts:
+        text = str(post.get("text", "")).strip()
+        if text and text not in existing_texts:
+            new_rows.append({
+                "timestamp": post.get("timestamp", datetime.now(timezone.utc).isoformat()),
+                "text": text,
+                "followers": post.get("followers", 1),
+            })
+            existing_texts.add(text)
+
+    if not new_rows:
+        return 0
+
+    new_df = pd.DataFrame(new_rows)
+    combined = pd.concat([existing_df, new_df], ignore_index=True)
+    combined.to_csv(path, index=False)
+    return len(new_rows)
+
+
+def fetch_and_analyze_reddit(models, tracker: MetricsTracker, cfg: RedditConfig) -> int:
+    """Fetch Reddit comments, analyze them, append to CSV. Returns count of new posts."""
+    print(f"\n🌐 Fetching up to {cfg.limit} comments from r/{cfg.subreddit}…")
+    posts = fetch_reddit_posts(cfg)
+    if not posts:
+        print("  ⚠️  No Reddit data returned (check credentials or subreddit name).")
+        return 0
+
+    print(f"  📥 Fetched {len(posts)} comments from Reddit.")
+
+    # Append to CSV
+    new_count = append_posts_to_csv(posts, DATA_SOURCE)
+    if new_count > 0:
+        print(f"  💾 Appended {new_count} new unique posts to '{DATA_SOURCE}'.")
+    else:
+        print("  ℹ️  No new unique posts (all duplicates).")
+
+    # Analyze new posts
+    new_posts = [p for p in posts if str(p.get("text", "")).strip()]
+    if new_posts:
+        print(f"\n  📊 Analysing {len(new_posts)} Reddit comments…\n")
+        stream_analyze(new_posts, models, tracker, start_idx=0)
+        tracker.print_snapshot()
+        tracker.print_keywords()
+        tracker.print_ai_insights()
+
+    return new_count
+
+
+def reddit_live_loop(models, tracker: MetricsTracker, cfg: RedditConfig) -> None:
+    """Continuously fetch Reddit comments at intervals and analyze them in real-time."""
+    print(f"\n{'=' * 60}")
+    print(f"  🔴 LIVE REDDIT MODE — r/{cfg.subreddit}")
+    print(f"  Polling every {REDDIT_POLL}s | Limit: {cfg.limit} comments/fetch")
+    print(f"  Press Ctrl+C to stop.")
+    print(f"{'=' * 60}\n")
+
+    seen_texts: set[str] = set()
+    cycle = 0
+
+    try:
+        while True:
+            cycle += 1
+            print(f"\n--- Fetch cycle #{cycle} ({datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}) ---")
+
+            posts = fetch_reddit_posts(cfg)
+            if not posts:
+                print("  ⚠️  No data returned. Retrying next cycle…")
+                time.sleep(REDDIT_POLL)
+                continue
+
+            # Filter to truly new posts
+            new_posts = []
+            for p in posts:
+                text = str(p.get("text", "")).strip()
+                if text and text not in seen_texts:
+                    new_posts.append(p)
+                    seen_texts.add(text)
+
+            if not new_posts:
+                print(f"  ℹ️  {len(posts)} fetched, 0 new. Waiting…")
+                time.sleep(REDDIT_POLL)
+                continue
+
+            print(f"  📥 {len(new_posts)} new comments (out of {len(posts)} fetched).")
+
+            # Save to CSV
+            saved = append_posts_to_csv(new_posts, DATA_SOURCE)
+            if saved:
+                print(f"  💾 Saved {saved} new rows to '{DATA_SOURCE}'.")
+
+            # Analyze live
+            print()
+            stream_analyze(new_posts, models, tracker, start_idx=0)
+            tracker.print_snapshot()
+
+            # Show keywords every 3 cycles
+            if cycle % 3 == 0:
+                tracker.print_keywords()
+                tracker.print_ai_insights()
+
+            print(f"\n  ⏳ Next fetch in {REDDIT_POLL}s…")
+            time.sleep(REDDIT_POLL)
+
+    except KeyboardInterrupt:
+        print("\n\n⏹  Reddit live mode stopped.")
+        tracker.print_snapshot()
+        tracker.print_keywords()
+        tracker.print_ai_insights()
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 def main() -> None:
     print("=" * 60)
     print("  🛡️  SENTINEL AI — Dynamic Analysis Pipeline")
     print("=" * 60)
-    print(f"  Data source:  {DATA_SOURCE}")
+    print()
+    print("  Modes:")
+    print("    1. Analyse CSV + watch for updates")
+    print("    2. Fetch Reddit comments (one-time) + analyse")
+    print("    3. Live Reddit stream (continuous polling)")
+    print("    4. Full pipeline: CSV + Reddit live")
+    print()
+
+    mode = input("  Select mode [1/2/3/4] (default=1): ").strip() or "1"
+
+    print(f"\n  Data source:  {DATA_SOURCE}")
     print(f"  Poll interval: {POLL_INTERVAL}s")
     print()
 
@@ -232,11 +395,56 @@ def main() -> None:
     print(
         f"✅ Models loaded in {t1 - t0:.1f}s  "
         f"(sentiment={'HF' if models.sentiment_pipe else 'fallback'}, "
-        f"aspect={'HF' if models.aspect_pipe else 'fallback'})"
+        f"aspect={'HF' if models.aspect_pipe else 'fallback'})\n"
     )
 
-    # --- Initial analysis: stream through all existing data ---
-    print(f"\n📊 Streaming analysis of '{DATA_SOURCE}'…\n")
+    tracker = MetricsTracker()
+
+    # --- MODE 1: CSV analysis + file watcher ---
+    if mode == "1":
+        run_csv_analysis(models, tracker)
+        watch_and_update(models, tracker)
+
+    # --- MODE 2: One-time Reddit fetch + analyse ---
+    elif mode == "2":
+        print("🌐 Reddit Configuration:")
+        cfg = get_reddit_config()
+        # First analyse existing CSV if present
+        try:
+            posts = read_stream_source(DATA_SOURCE)
+            print(f"\n📊 Analysing {len(posts)} existing posts from CSV…\n")
+            stream_analyze(posts, models, tracker)
+        except (FileNotFoundError, ValueError):
+            print("  No existing CSV data. Starting fresh.\n")
+        # Fetch and analyse Reddit
+        fetch_and_analyze_reddit(models, tracker, cfg)
+        tracker.print_snapshot()
+        tracker.print_keywords()
+        tracker.print_ai_insights()
+
+    # --- MODE 3: Continuous Reddit live stream ---
+    elif mode == "3":
+        print("🌐 Reddit Configuration:")
+        cfg = get_reddit_config()
+        reddit_live_loop(models, tracker, cfg)
+
+    # --- MODE 4: CSV + Reddit live (full pipeline) ---
+    elif mode == "4":
+        print("🌐 Reddit Configuration:")
+        cfg = get_reddit_config()
+        # Analyse existing CSV first
+        run_csv_analysis(models, tracker)
+        # Then enter Reddit live loop
+        reddit_live_loop(models, tracker, cfg)
+
+    else:
+        print("❌ Invalid mode. Use 1, 2, 3, or 4.")
+        sys.exit(1)
+
+
+def run_csv_analysis(models, tracker: MetricsTracker) -> None:
+    """Analyse all posts from the CSV data source."""
+    print(f"📊 Streaming analysis of '{DATA_SOURCE}'…\n")
     try:
         posts = read_stream_source(DATA_SOURCE)
     except FileNotFoundError:
@@ -246,16 +454,10 @@ def main() -> None:
         print(f"❌ Data format error: {e}")
         sys.exit(1)
 
-    tracker = MetricsTracker()
     stream_analyze(posts, models, tracker)
-
-    # --- Full report ---
     tracker.print_snapshot()
     tracker.print_keywords()
     tracker.print_ai_insights()
-
-    # --- Enter watch mode for dynamic updates ---
-    watch_and_update(models, tracker)
 
 
 if __name__ == "__main__":
