@@ -18,7 +18,13 @@ from engine import (
     fetch_reddit_posts,
     load_models,
 )
-from utils import generate_ai_response, read_stream_source, summarize_root_cause
+from utils import (
+    fetch_rss_posts,
+    generate_ai_response,
+    read_stream_source,
+    read_uploaded_file,
+    summarize_root_cause,
+)
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -732,6 +738,40 @@ def live_ticker() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Fragment: RSS auto-poll (fetches new RSS items periodically)
+# ---------------------------------------------------------------------------
+@st.fragment(run_every=timedelta(seconds=60))
+def rss_auto_poller() -> None:
+    """Periodically fetch new RSS items when auto-poll is enabled."""
+    rss_url = st.session_state.get("rss_auto_url")
+    if not rss_url:
+        return
+
+    limit = st.session_state.get("rss_auto_limit", 15)
+    rss_posts = fetch_rss_posts(rss_url, limit=limit)
+    if not rss_posts:
+        return
+
+    # Deduplicate: skip posts whose text already exists in history
+    existing_texts = set()
+    if not st.session_state.history_df.empty:
+        existing_texts = set(st.session_state.history_df["raw_text"].tolist())
+
+    new_posts = [p for p in rss_posts if str(p.get("text", "")) not in existing_texts]
+    if not new_posts:
+        return
+
+    models = get_models()
+    rows = [analyze_post(p, models) for p in new_posts]
+    new_df = pd.DataFrame(rows)
+    new_df["timestamp"] = pd.to_datetime(new_df["timestamp"], errors="coerce")
+    frames = [st.session_state.history_df, new_df]
+    frames = [f for f in frames if not f.empty and not f.isna().all(axis=None)]
+    st.session_state.history_df = pd.concat(frames, ignore_index=True)
+    st.session_state.setdefault("all_posts", []).extend(new_posts)
+
+
+# ---------------------------------------------------------------------------
 # Sidebar controls
 # ---------------------------------------------------------------------------
 def sidebar_controls() -> None:
@@ -776,6 +816,113 @@ def sidebar_controls() -> None:
         st.session_state.ai_chat = []
         st.rerun()
 
+    # ------------------------------------------------------------------
+    # 📝 Instant Text Analysis
+    # ------------------------------------------------------------------
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 📝 Instant Analysis")
+    user_text = st.sidebar.text_area(
+        "Paste or type any post/review/comment:",
+        placeholder="e.g. This product is amazing but the customer support is terrible…",
+        height=100,
+        key="instant_text",
+    )
+    user_followers = st.sidebar.number_input(
+        "Author followers (influence weight)", min_value=1, value=100, step=50, key="instant_followers",
+    )
+    if st.sidebar.button("🔍 Analyse Now", key="instant_analyse_btn"):
+        if user_text.strip():
+            models = get_models()
+            post = {
+                "text": user_text.strip(),
+                "timestamp": pd.Timestamp.now(tz="UTC").isoformat(),
+                "followers": user_followers,
+                "source": "manual",
+            }
+            analyzed = analyze_post(post, models)
+            new_row = pd.DataFrame([analyzed])
+            frames = [st.session_state.history_df, new_row]
+            frames = [f for f in frames if not f.empty and not f.isna().all(axis=None)]
+            st.session_state.history_df = pd.concat(frames, ignore_index=True)
+            st.session_state.history_df["timestamp"] = pd.to_datetime(
+                st.session_state.history_df["timestamp"], errors="coerce"
+            )
+            st.sidebar.success(
+                f"✅ **{analyzed['final_sentiment']}** | Aspect: {analyzed['aspect']} | "
+                f"Crisis: {analyzed['crisis_score']}"
+            )
+        else:
+            st.sidebar.warning("Please enter some text to analyse.")
+
+    # ------------------------------------------------------------------
+    # 📁 File Upload (CSV / JSON)
+    # ------------------------------------------------------------------
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 📁 Upload Dataset")
+    uploaded_file = st.sidebar.file_uploader(
+        "Drop a CSV or JSON file",
+        type=["csv", "json"],
+        key="file_uploader",
+    )
+    if uploaded_file is not None:
+        upload_key = f"uploaded_{uploaded_file.name}_{uploaded_file.size}"
+        if st.session_state.get("last_upload_key") != upload_key:
+            try:
+                file_bytes = uploaded_file.getvalue()
+                file_posts = read_uploaded_file(file_bytes, uploaded_file.name)
+                models = get_models()
+                rows = [analyze_post(p, models) for p in file_posts]
+                new_df = pd.DataFrame(rows)
+                new_df["timestamp"] = pd.to_datetime(new_df["timestamp"], errors="coerce")
+                frames = [st.session_state.history_df, new_df]
+                frames = [f for f in frames if not f.empty and not f.isna().all(axis=None)]
+                st.session_state.history_df = pd.concat(frames, ignore_index=True)
+                # Also append to all_posts so live ticker can cycle through them
+                st.session_state.setdefault("all_posts", []).extend(file_posts)
+                st.session_state["last_upload_key"] = upload_key
+                st.sidebar.success(f"✅ Loaded & analysed **{len(file_posts)}** posts from {uploaded_file.name}")
+            except Exception as exc:
+                st.sidebar.error(f"Upload error: {exc}")
+
+    # ------------------------------------------------------------------
+    # 📡 RSS Feed (live external data — no API key)
+    # ------------------------------------------------------------------
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 📡 RSS Live Feed")
+    rss_url = st.sidebar.text_input(
+        "RSS / Atom feed URL",
+        placeholder="https://news.ycombinator.com/rss",
+        key="rss_url_input",
+    )
+    rss_limit = st.sidebar.slider("Max items to fetch", 5, 50, 15, key="rss_limit")
+    rss_auto = st.sidebar.checkbox("Auto-poll every 60s", value=False, key="rss_auto_poll")
+    if rss_auto and rss_url.strip():
+        st.session_state["rss_auto_url"] = rss_url.strip()
+        st.session_state["rss_auto_limit"] = rss_limit
+    else:
+        st.session_state.pop("rss_auto_url", None)
+
+    if st.sidebar.button("📥 Fetch RSS Now", key="rss_fetch_btn"):
+        if rss_url.strip():
+            rss_posts = fetch_rss_posts(rss_url.strip(), limit=rss_limit)
+            if not rss_posts:
+                st.sidebar.warning("No RSS data returned — check the URL or install `feedparser`.")
+            else:
+                models = get_models()
+                rows = [analyze_post(p, models) for p in rss_posts]
+                new_df = pd.DataFrame(rows)
+                new_df["timestamp"] = pd.to_datetime(new_df["timestamp"], errors="coerce")
+                frames = [st.session_state.history_df, new_df]
+                frames = [f for f in frames if not f.empty and not f.isna().all(axis=None)]
+                st.session_state.history_df = pd.concat(frames, ignore_index=True)
+                st.session_state.setdefault("all_posts", []).extend(rss_posts)
+                st.sidebar.success(f"✅ Fetched & analysed **{len(rss_posts)}** RSS items.")
+        else:
+            st.sidebar.warning("Enter an RSS feed URL first.")
+
+    # ------------------------------------------------------------------
+    # 🌐 Reddit (PRAW)
+    # ------------------------------------------------------------------
     st.sidebar.markdown("---")
     st.sidebar.markdown("### 🌐 Reddit (PRAW)")
     r_client = st.sidebar.text_input("Client ID", type="password")
@@ -830,6 +977,9 @@ def main() -> None:
     # Seamless live ticker — runs as an independent fragment,
     # adds 1 new post every 2 seconds WITHOUT refreshing the page
     live_ticker()
+
+    # RSS auto-poll — fetches new RSS items every 60s when enabled
+    rss_auto_poller()
 
 
 main()
